@@ -33,8 +33,13 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
-*.mp4
-*.wav
-*.mp3
-
 .venv
+frames
+*.mp4
+
+*.txt
+*.json
+
+!tsconfig.json
+!requirements.txt
+!package.json

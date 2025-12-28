@@ -1,0 +1,27 @@
+{
+  "name": "tc-1",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "detect": "bun run src/cli.ts",
+    "scenes": "bun run src/cli.ts",
+    "transcription": "bun run scripts/transcription.ts",
+    "finalize": "bun run scripts/finalize.ts",
+    "transcribe": "bun run scripts/transcribe.ts",
+    "transcribe:openai": "bun run scripts/transcribe-openai.ts",
+    "describe": "bun run scripts/describe.ts",
+    "setup": "chmod +x setup.sh && ./setup.sh"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@google/genai": "^1.34.0",
+    "openai": "^6.15.0",
+    "zod": "^4.2.1"
+  }
+}
