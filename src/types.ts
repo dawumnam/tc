@@ -21,6 +21,24 @@ export interface DetectionResult {
   shots: Shot[];
 }
 
+export interface Caption {
+  type: "자막" | "정보자막" | "말자막";
+  text: string;
+}
+
+export interface GeneratedShot extends Shot {
+  description: string;
+  sov_cues: SovCue[];
+  captions: Caption[];
+}
+
+export interface GenerateResult {
+  video: string;
+  fps: number;
+  total_frames: number;
+  shots: GeneratedShot[];
+}
+
 export interface DetectionError {
   error: string;
 }

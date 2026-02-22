@@ -10,9 +10,19 @@ import sys
 import os
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress TF logging
+os.environ["TF_USE_LEGACY_KERAS"] = "1"  # Keras 3 breaks Metal GPU; use Keras 2
 
 import numpy as np
 import tensorflow as tf
+
+# Ensure Metal GPU is used when available
+gpus = tf.config.list_physical_devices("GPU")
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    print(f"Using GPU: {gpus[0].name}", file=sys.stderr)
+else:
+    print("WARNING: No GPU found, running on CPU", file=sys.stderr)
 
 
 class TransNetV2:
@@ -65,9 +75,30 @@ class TransNetV2:
         """Log progress to stderr."""
         print(msg, file=sys.stderr, flush=True)
 
+    def _cache_path(self, video_path: str, suffix: str) -> str:
+        """Return cache file path next to the source video."""
+        return video_path + suffix
+
+    def _cache_valid(self, video_path: str, cache_path: str) -> bool:
+        """Check if cache exists and is newer than the video file."""
+        if not os.path.exists(cache_path):
+            return False
+        return os.path.getmtime(cache_path) >= os.path.getmtime(video_path)
+
     def _extract_frames(self, video_path: str) -> tuple[np.ndarray, float, int]:
         """Extract frames from FHD video, downscale to 48x27 for model input."""
         import subprocess
+
+        frames_cache = self._cache_path(video_path, ".transnet_frames.npz")
+
+        if self._cache_valid(video_path, frames_cache):
+            self._log("Loading cached frames...")
+            data = np.load(frames_cache)
+            frames = data["frames"]
+            fps = float(data["fps"])
+            total_frames = int(data["total_frames"])
+            self._log(f"Loaded {len(frames)} cached frames ({fps:.2f} fps)")
+            return frames, fps, total_frames
 
         self._log("Probing video...")
 
@@ -120,23 +151,20 @@ class TransNetV2:
 
         self._log(f"Extracted {num_frames} frames ({fps:.2f} fps)")
 
+        # Cache frames next to video
+        np.savez_compressed(frames_cache, frames=frames, fps=fps, total_frames=total_frames)
+        self._log(f"Cached frames to {frames_cache}")
+
         return frames, fps, total_frames
 
-    def predict(self, video_path: str, threshold: float = 0.5) -> dict:
-        """Run shot boundary detection on a video."""
-        self._log("Loading model...")
-        self._ensure_model()
-
-        frames, fps, total_frames = self._extract_frames(video_path)
+    def _run_inference(self, video_path: str, frames: np.ndarray) -> np.ndarray:
+        """Run batched TransNetV2 inference. Returns per-frame predictions."""
         num_frames = len(frames)
-
-        # Cast to float32 but keep 0-255 range (model handles normalization internally)
         frames_float = frames.astype(np.float32)
 
         window_size = 100
-        step_size = 50  # Overlap by 50, take center predictions
+        step_size = 50
 
-        # Pad frames for clean windowing
         pad_start = 25
         pad_end = 25 + (window_size - (num_frames % window_size)) % window_size
         frames_padded = np.pad(
@@ -147,70 +175,68 @@ class TransNetV2:
 
         padded_len = len(frames_padded)
         total_windows = (padded_len - window_size) // step_size + 1
-        all_predictions = []
 
         self._log("Running inference...")
 
-        for window_idx in range(total_windows):
-            start = window_idx * step_size
-            end = start + window_size
-            batch = frames_padded[start:end]
+        max_batch = 128
+        all_predictions = []
 
-            batch_tensor = tf.constant(batch[np.newaxis, ...], dtype=tf.float32)
-            result = self._model(batch_tensor)
+        for batch_start in range(0, total_windows, max_batch):
+            batch_end = min(batch_start + max_batch, total_windows)
 
-            # Debug first batch
-            if window_idx == 0:
-                self._log(f"Model output type: {type(result)}")
-                if isinstance(result, tuple):
-                    self._log(f"Tuple length: {len(result)}")
-                    for i, r in enumerate(result):
-                        if hasattr(r, 'shape'):
-                            self._log(f"  [{i}] shape: {r.shape}, min: {float(tf.reduce_min(r)):.4f}, max: {float(tf.reduce_max(r)):.4f}")
-                        elif isinstance(r, dict):
-                            self._log(f"  [{i}] dict keys: {list(r.keys())}")
+            windows = np.stack([
+                frames_padded[i * step_size : i * step_size + window_size]
+                for i in range(batch_start, batch_end)
+            ])
 
-            # Extract logits (first element of tuple)
+            with tf.device("/GPU:0" if gpus else "/CPU:0"):
+                batch_tensor = tf.constant(windows, dtype=tf.float32)
+                result = self._model(batch_tensor)
+
             if isinstance(result, tuple):
                 logits = result[0]
             else:
                 logits = result
 
-            # Apply sigmoid to convert logits to probabilities
             pred = tf.sigmoid(logits).numpy()
 
-            # Debug shape
-            if window_idx == 0:
-                self._log(f"Pred shape after sigmoid: {pred.shape}")
-
-            # Handle different possible shapes
             if pred.ndim == 3:
-                pred = pred[0, :, 0]
-            elif pred.ndim == 2:
-                pred = pred[0, :]
+                pred = pred[:, :, 0]
 
-            # Take center 50 frames (indices 25-74)
-            center_pred = pred[25:75]
-            all_predictions.append(center_pred)
+            center_preds = pred[:, 25:75]
+            all_predictions.append(center_preds.reshape(-1))
 
-            progress = int(((window_idx + 1) / total_windows) * 100)
-            self._log(f"Progress: {progress}% ({window_idx + 1}/{total_windows})")
-
-        # Concatenate and trim to original length
-        predictions = np.concatenate(all_predictions)[:num_frames]
-
-        if not all_predictions:
-            self._log("Done. No shots detected.")
-            return {
-                "video": video_path,
-                "fps": fps,
-                "total_frames": total_frames,
-                "shots": [],
-            }
+            self._log(f"Progress: {batch_end}/{total_windows} windows")
 
         predictions = np.concatenate(all_predictions)[:num_frames]
+        return predictions
 
-        # Debug: show prediction stats
+    def predict(self, video_path: str, threshold: float = 0.5) -> dict:
+        """Run shot boundary detection on a video."""
+        frames, fps, total_frames = self._extract_frames(video_path)
+        num_frames = len(frames)
+
+        preds_cache = self._cache_path(video_path, ".transnet_preds.npy")
+
+        if self._cache_valid(video_path, preds_cache):
+            self._log("Loading cached predictions...")
+            predictions = np.load(preds_cache)
+            if len(predictions) == num_frames:
+                self._log(f"Loaded cached predictions ({len(predictions)} frames)")
+            else:
+                self._log("Cache frame count mismatch, re-running inference...")
+                self._log("Loading model...")
+                self._ensure_model()
+                predictions = self._run_inference(video_path, frames)
+                np.save(preds_cache, predictions)
+                self._log(f"Cached predictions to {preds_cache}")
+        else:
+            self._log("Loading model...")
+            self._ensure_model()
+            predictions = self._run_inference(video_path, frames)
+            np.save(preds_cache, predictions)
+            self._log(f"Cached predictions to {preds_cache}")
+
         self._log(f"Predictions min={predictions.min():.4f} max={predictions.max():.4f} mean={predictions.mean():.4f}")
 
         shot_boundaries = np.where(predictions > threshold)[0].tolist()
