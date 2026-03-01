@@ -20,8 +20,11 @@ bun run generate --video <video.mp4> --scenes scenes.json --output result
 Options:
 - `--segment-duration <s>` — Segment duration in seconds (default: 300)
 - `--file-uri <uri>` — Skip upload, reuse existing Gemini file URI
-- `--retries <n>` — Retries per segment (default: 2)
+- `--retries <n>` — Retries per segment (default: 1)
+- `--retry-delay-ms <n>` — Base retry delay in milliseconds (default: 300)
+- `--retry-max-delay-ms <n>` — Max retry delay in milliseconds (default: 1200)
 - `--max-segments <n>` — Only process first N segments (for testing)
+- `--examples <dir>` — Path to few-shot examples directory for improved scene labeling
 - `--rebuild-hwpx` — Rebuild HWPX + TXT from existing JSON without calling Gemini (only `--output` required)
 
 Outputs: `result.json`, `result.txt`, `result.hwpx`
@@ -36,6 +39,7 @@ File URI caching: After first upload, the Gemini file URI is saved to `{output}.
 - `src/utils.ts` — Helpers: `toMMSS()`, `formatKoreanTxt()` (legacy scene format), `groupWordsBySpeaker()`, `parseOffset()`
 - `src/cli.ts` + `src/.shot-detect.ts` — Bun CLI wrapper for shot detection (spawns Python subprocess)
 - `empty.hwpx` — HWPX template for output generation (root-level, used by generate.ts)
+- `examples/` — Few-shot image examples for scene labeling (manifest.json + images)
 
 ## Output Format (TXT/HWPX Cue Sheet)
 
@@ -78,13 +82,48 @@ Appended to description before duration. Values: `ws`, `bs`, `cs`, `fs`, `ins`, 
 
 ## Gemini Integration
 
-- Model: `gemini-3.1-pro-preview`
+- Model: `gemini-3.1-pro-preview` (default), `gemini-3-flash-preview` (fast/cheap via `--model`)
 - Uses `@google/genai` SDK with `generateContent()` and video `fileData` with `startOffset`/`endOffset`
 - Hand-written JSON schema for `responseSchema` (NOT zod's `z.toJSONSchema()` — causes Gemini nesting depth error)
 - Segment padding: 2 seconds on each side of the time window sent to Gemini
 - Response: structured JSON with `shots[]` containing `shot_index`, `description`, `shot_label`, `sov_cues[]`, `captions[]`
 - `shot_label` returned separately from description — merged in code as `${description} ${shot_label}` (with dedup check)
-- Exponential backoff retry on failure (2^attempt * 1000ms)
+- Short-capped exponential backoff retry on failure (`min(maxDelay, baseDelay * 2^(attempt-1))`)
+- Few-shot examples: optional multi-turn image examples prepended to `contents[]` (see below)
+
+## Few-Shot Examples
+
+Optional image examples that improve scene description and shot_label accuracy via `--examples <dir>`.
+
+### Directory Structure
+```
+examples/
+  manifest.json
+  drone-cityscape.jpg
+  cue-curating-ws.jpg
+  ...
+```
+
+### Manifest Format (`manifest.json`)
+```json
+[
+  {
+    "images": ["drone-cityscape-1.jpg", "drone-cityscape-2.jpg", "drone-cityscape-3.jpg"],
+    "label": { "description": "드론, 울란바토르 시내 전경", "shot_label": null }
+  },
+  {
+    "images": ["cue-curating-ws-1.jpg", "cue-curating-ws-2.jpg"],
+    "label": { "description": "걸어오며 큐레이팅 큐", "shot_label": "ws" }
+  }
+]
+```
+
+- Each entry: array of image filenames (frame sequence) + expected `description` and `shot_label`
+- Images are base64-encoded inline with per-part `mediaResolution: LOW` (~280 tokens each, matching video frame resolution ~258)
+- Prepended as multi-turn user/model Content pairs before the video+prompt turn
+- Model turn JSON uses exact `BATCH_RESPONSE_SCHEMA` property ordering
+- Examples loaded once in `main()`, reused across all segments
+- 5-10 examples recommended; ~2.6K extra tokens total (negligible in 1M context)
 
 ## HWPX Generation
 
